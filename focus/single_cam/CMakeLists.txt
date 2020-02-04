@@ -1,4 +1,4 @@
-project(tcamopencvsaveimage)
+project(singleFocus)
  
 cmake_minimum_required(VERSION 2.6)
 set(CMAKE_CXX_STANDARD 11)
@@ -15,9 +15,9 @@ message( ${TCAMLIB_LIBRARIES})
 include_directories( ${CMAKE_CURRENT_BINARY_DIR}  ${GSTREAMER_INCLUDE_DIRS} ${TCAM_INCLUDE_DIRS}  ${OpenCV_INCLUDE_DIRS} )
 add_definitions(${GSTREAMER_CFLAGS_OTHER})  
 
-add_executable(tcamopencvsaveimage main.cpp tcamcamera.cpp )
+add_executable(singleFocus main.cpp tcamcamera.cpp )
 
-target_link_libraries(tcamopencvsaveimage ${TCAMLIB_LIBRARIES} ${GSTREAMER_LIBRARIES} ${OpenCV_LIBS} )
+target_link_libraries(singleFocus ${TCAMLIB_LIBRARIES} ${GSTREAMER_LIBRARIES} ${OpenCV_LIBS} )
 
-install(TARGETS tcamopencvsaveimage RUNTIME DESTINATION bin)
+install(TARGETS singleFocus RUNTIME DESTINATION bin)
  
