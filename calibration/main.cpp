@@ -42,13 +42,20 @@ void help(char *argv[]) {
 
 string concatFileName(int camNo, int curFrame)
 {
-    string fileName = "../good_photos/cam_" + std::to_string(camNo) + "_" + std::to_string(curFrame) + ".jpg";
+    string fileName = "cam_" + std::to_string(camNo) + "_" + std::to_string(curFrame);
     return fileName;
 }
 
+string concatFilePath(string dataDir, string fileName)
+{
+  string filePath = "../" + dataDir + "/" + fileName + ".jpg";
+  return filePath;
+}
+
 static void StereoCalib(int nImages, int nx, int ny,
+                        string dataDir,
                         bool useUncalibrated) {
-  bool displayCorners = true;
+  bool displayCorners = false;
   bool showUndistorted = true;
   bool isVerticalStereo = false; // horiz or vert cams
   const int maxScale = 1;
@@ -59,7 +66,7 @@ static void StereoCalib(int nImages, int nx, int ny,
   int i, j, k, lr;
   int N = nx * ny;
   cv::Size board_sz = cv::Size(nx, ny);
-  vector<vector<string> > imageNames[2][nImages];
+  vector<string> imageNames[2];
   vector<cv::Point3f> boardModel;
   vector<vector<cv::Point3f> > objectPoints;
   vector<vector<cv::Point2f> > points[2];
@@ -67,40 +74,67 @@ static void StereoCalib(int nImages, int nx, int ny,
   bool found[2] = {false, false};
   cv::Size imageSize;
 
-  for (i = 0; i < ny; i++)
-    for (j = 0; j < nx; j++)
-      boardModel.push_back(
-          cv::Point3f((float)(i * squareSize), (float)(j * squareSize), 0.f));
+  for (i = 0; i < ny; i++) {
+    for (j = 0; j < nx; j++) {
+      boardModel.push_back(cv::Point3f((float)(i * squareSize), (float)(j * squareSize), 0.f));
+    }
+  }
 
   for (k = 1; k <= nImages; k++) {
     for (lr = 0; lr < nCam; lr++) {
-      string imgPath = concatFileName(lr+1, k);
-      imageNames[lr][k] = imgPath;
+      string imgName = concatFileName(lr+1, k);
+      string ymlName = imgName + ".yml";
+      cv::FileStorage fs(ymlName, cv::FileStorage::READ);
+      bool hasData = false;
+      if (fs.isOpened()) {
+        cv::Mat mcorners;
+        fs[imgName] >> mcorners;
+        cout << mcorners.size() << endl;
+        if (mcorners.cols == 1 && mcorners.rows == N ) {
+          mcorners = mcorners.reshape(2, N);
+          corners[lr] = mcorners.clone();
+          found[lr] = true;
+          cout << corners[lr] << endl;
+          hasData = true;
+        }
+      }
+      string imgPath = concatFilePath(dataDir, imgName);
+      cout << imgPath << endl;
+      imageNames[lr].push_back(imgPath);
       cv::Mat img = cv::imread(imgPath, 0);
-      if (img.empty())
-        break;
       imageSize = img.size();
 
-      // Find circle grids and centers therein:
-      for (int s = 1; s <= maxScale; s++) {
-        cv::Mat timg = img;
-        if (s > 1)
-          resize(img, timg, cv::Size(), s, s, cv::INTER_CUBIC);
-        // Just as example, this would be the call if you had circle calibration
-        // boards ...
-        //      found[lr] = cv::findCirclesGrid(timg, cv::Size(nx, ny),
-        //      corners[lr],
-        //                                      cv::CALIB_CB_ASYMMETRIC_GRID |
-        //                                          cv::CALIB_CB_CLUSTERING);
-        //...but we have chessboards in our images
-        found[lr] = cv::findChessboardCorners(timg, board_sz, corners[lr]);
-
-        if (found[lr] || s == maxScale) {
-          cv::Mat mcorners(corners[lr]);
-          mcorners *= (1. / s);
-        }
-        if (found[lr])
+      if (!hasData) {
+        if (img.empty())
           break;
+
+        // Find circle grids and centers therein:
+        for (int s = 1; s <= maxScale; s++) {
+          cv::Mat timg;
+          img.convertTo(timg, -1, 4, 0);
+          if (s > 1)
+            resize(img, timg, cv::Size(), s, s, cv::INTER_CUBIC);
+          // Just as example, this would be the call if you had circle calibration
+          // boards ...
+          //      found[lr] = cv::findCirclesGrid(timg, cv::Size(nx, ny),
+          //      corners[lr],
+          //                                      cv::CALIB_CB_ASYMMETRIC_GRID |
+          //                                          cv::CALIB_CB_CLUSTERING);
+          //...but we have chessboards in our images
+          found[lr] = cv::findChessboardCorners(timg, board_sz, corners[lr]);
+          cout << corners[lr].size() << endl;
+          if (found[lr] || s == maxScale) {
+            cv::Mat mcorners(corners[lr]);
+            mcorners *= (1. / s);
+            cv::FileStorage fs(ymlName, cv::FileStorage::WRITE);
+
+            cout << mcorners.size() << endl;
+            fs << imgName << mcorners;
+            fs.release();
+          }
+          if (found[lr])
+            break;
+        }
       }
       if (displayCorners) {
 
@@ -109,17 +143,15 @@ static void StereoCalib(int nImages, int nx, int ny,
         cv::imshow("Corners", img);
         if ((cv::waitKey(0) & 255) == 27) // Allow ESC to quit
           exit(-1);
-      } else
-        cout << '.';
+      }
       if (lr == 1 && found[0] && found[1]) {
         objectPoints.push_back(boardModel);
         points[0].push_back(corners[0]);
         points[1].push_back(corners[1]);
+        cout << imageSize << endl;
       }
     }
   }
-  fclose(f);
-
   // CALIBRATE THE STEREO CAMERAS
   cv::Mat M1 = cv::Mat::eye(3, 3, CV_64F);
   cv::Mat M2 = cv::Mat::eye(3, 3, CV_64F);
@@ -132,7 +164,7 @@ static void StereoCalib(int nImages, int nx, int ny,
       cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 100,
                        1e-5));
   cout << "Done! Press any key to step through images, ESC to exit\n\n";
-
+  cout << M1 << endl;
   // CALIBRATION QUALITY CHECK
   // because the output fundamental matrix implicitly
   // includes all the output information,
@@ -232,6 +264,13 @@ static void StereoCalib(int nImages, int nx, int ny,
         cv::line(pair, cv::Point(0, j), cv::Point(imageSize.width * 2, j),
                   cv::Scalar(0, 255, 0));
       cv::imshow("rectified", pair);
+      // Compute disparity
+      // cv::Mat disparity;
+      // cv::Ptr<cv::StereoMatcher> pStereo = cv::StereoSGBM::create(0,   // minimum disparity
+      //                                                           256,  // maximum disparity
+      //                                                           5);  // block size
+      // pStereo->compute(img1r, img2r, disparity);
+      // cv::imshow("depth", disparity);
       if ((cv::waitKey() & 255) == 27)
         break;
     }
@@ -251,19 +290,23 @@ static void StereoCalib(int nImages, int nx, int ny,
 
 
 int main(int argc, char **argv) {
-  help(argv);
   char cCurrentPath[FILENAME_MAX];
   if (!getcwd(cCurrentPath, sizeof(cCurrentPath)))
   {
-      return errno;
+    return errno;
   }
-  curPath = string(cCurrentPath);
+
   int board_w = 9, board_h = 5;
   int nImages;
-  if (argc == 4) {
+  string dataDir;
+  if (argc == 5) {
     nImages = atoi(argv[1]);
     board_w = atoi(argv[2]);
     board_h = atoi(argv[3]);
+    dataDir = argv[4];
+    StereoCalib(nImages, board_w, board_h, dataDir, true);
+  } else {
+    help(argv);
   }
-  StereoCalib(nImages, board_w, board_h, true);
   return 0;
+}
