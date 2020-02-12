@@ -5,38 +5,298 @@
 #include <stdio.h>
 #include <math.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <bits/stdc++.h> 
+#include <iostream> 
+#include <sys/stat.h> 
+#include <sys/types.h> 
 
 using namespace std;
 
-string curPath;
+void help(char *argv[]);
+bool checkImagePairExists();
+string concatFileName(int camNo, int curFrame);
+string concatFilePath(string dataDir, string fileName);
+bool checkExistingCorners(string imgName, string ymlName,
+                          vector<cv::Point2f> *corners, 
+                          int lr, int nCorners);
+bool autoFindCorners(cv::Mat img, cv::Size board_sz, 
+                     vector<cv::Point2f> *corners, int lr);
+double checkCalibrationQuality(vector<vector<cv::Point2f>> points[2],
+                              cv::Mat M1, cv::Mat D1,  cv::Mat M2, cv::Mat D2,
+                              cv::Mat F, int nFrames, int nCorners);
+static void StereoCalib(int nImages, int nx, int ny,
+                        string dataDir, bool useUncalibrated);
+void rectifyAndDisp(cv::Mat img1, cv::Mat img2, cv::Mat pair, 
+                    cv::Mat map11, cv::Mat map12, cv::Mat map21, cv::Mat map22,
+                    cv::Ptr<cv::StereoMatcher> stereo,
+                    string rectName, string dispName);
+
+inline bool fileExists (const string& name) {
+  struct stat buffer;   
+  return (stat (name.c_str(), &buffer) == 0); 
+}
+
+int main(int argc, char **argv) 
+{
+  int board_w = 9, board_h = 5;
+  int nImages;
+  string dataDir;
+  
+  if (argc == 5) 
+  {
+    nImages = atoi(argv[1]);
+    board_w = atoi(argv[2]);
+    board_h = atoi(argv[3]);
+    dataDir = argv[4];
+    struct stat info;
+    if( stat( dataDir.c_str(), &info ) != 0 )
+    {
+      cout << "cannot access " << dataDir << endl;
+      return -1;
+    }
+    else if( (info.st_mode & S_IFDIR) == 0)
+    {
+      cout << dataDir << "is not a directory" << endl;
+      return -1;
+    }
+    StereoCalib(nImages, board_w, board_h, dataDir, true);
+  } 
+  else 
+  {
+    help(argv);
+  }
+  return 0;
+}
+
+// The main calibration function that 
+// 1. detects corners on chessboards
+// 2. calibrate each camera's intrinsics
+// 3. calibrate stereo camera extrinsics
+// 4. rectifies images
+// 5. finds correspondents
+//
+static void StereoCalib(int nImages, int nx, int ny,
+                        string dataDir,
+                        bool useUncalibrated) {
+  bool displayCorners = true;
+  const float squareSize = 1.f;
+  int nCam = 2;
+  struct stat info;
+  string outputDir = dataDir + "/output";
+  if( stat( outputDir.c_str(), &info ) != 0 )
+  {
+    mkdir(outputDir.c_str(), 0777);
+  }
+  string intrinsicsYmlL = outputDir + "/intrinsics_1.yml";
+  string intrinsicsYmlR = outputDir + "/intrinsics_2.yml";
+  string extrinsicsYml = outputDir + "/extrinsics.yml";
+
+  // actual square size
+  int i, j, k, lr;
+  int nCorners = nx * ny;
+  cv::Size board_sz = cv::Size(nx, ny);
+  vector<string> imageNames[2];
+  vector<cv::Point3f> boardModel;
+  vector<vector<cv::Point3f> > objectPoints;
+  vector<vector<cv::Point2f> > points[2];
+  vector<cv::Point2f> corners[2];
+  bool found[2] = {false, false};
+  cv::Size imageSize;
+
+  // create board model for chessboard detection
+  for (i = 0; i < ny; i++) {
+    for (j = 0; j < nx; j++) {
+      boardModel.push_back(cv::Point3f((float)(i * squareSize), (float)(j * squareSize), 0.f));
+    }
+  }
+
+  // 1. Extract corners out of each provided images of calibration target
+  for (k = 1; k <= nImages; k++) 
+  {
+    bool pairExists  = checkImagePairExists();
+    if (pairExists &&  k!=7 && k != 11 && k !=10)
+    {
+      for (lr = 0; lr < nCam; lr++) {
+        string imgName = concatFileName(lr+1, k);
+        string imgPath = concatFilePath(dataDir, imgName);
+        cout << imgPath << endl;
+
+        cv::Mat img = cv::imread(imgPath, 0);
+        if (img.empty()) 
+          break;
+        string ymlName = outputDir + "/" + imgName + ".yml";
+
+        imageNames[lr].push_back(imgPath);
+        imageSize = img.size();
+        // check if corners were already detected before and saved in yml files
+        found[lr] = checkExistingCorners(imgName, ymlName, corners, lr, nCorners);
+
+        // new data, attempt to find corners/grids
+        if (!found[lr]) 
+        {
+          found[lr] = autoFindCorners(img, board_sz, corners, lr);
+          if (found[lr]) {
+            // convert to opencv matrix to save in yml
+            cv::Mat mcorners(corners[lr]);
+            cv::FileStorage fs(ymlName, cv::FileStorage::WRITE);
+            fs << imgName << mcorners;
+            fs.release();
+          }
+        }
+        if (displayCorners) {
+          // draw chessboard corners works for circle grids too
+          cv::drawChessboardCorners(img, cv::Size(nx, ny), corners[lr], found[lr]);
+          string chessboardName = outputDir + "/chessboard_" + to_string(k) + "_" + to_string(lr) + ".png";
+          cv::imwrite(chessboardName, img);
+        }
+        // add corners when both left and rigth images were successfully
+        // detected
+        if (lr == 1 && found[0] && found[1]) {
+          objectPoints.push_back(boardModel);
+          points[0].push_back(corners[0]);
+          points[1].push_back(corners[1]);
+          cout << "ADDED" << endl;
+        }
+      }
+    }
+  }
+
+  // 2. Calibrate single cameras first for better optimzation
+  double initialIntrinsics[9] = {11363.6364, 0, 1296, 0, 11363.6364, 972, 0, 0, 1};
+  cv::Mat M1 = cv::Mat(3, 3, CV_64F, initialIntrinsics);
+  cv::Mat M2 = M1.clone();
+  cv::Mat D1, D2, R, T, E, F;
+  cout << "\nRunning single camera calibration ...\n";
+  double error1 = cv::calibrateCamera(objectPoints, points[0],
+                     imageSize, M1, D1,  R, T,
+                     cv::CALIB_USE_INTRINSIC_GUESS |
+                     cv::CALIB_FIX_ASPECT_RATIO |
+                     cv::CALIB_ZERO_TANGENT_DIST);
+  double error2 = cv::calibrateCamera(objectPoints, points[1],
+                     imageSize, M2, D2,  R, T,
+                     cv::CALIB_USE_INTRINSIC_GUESS |
+                     cv::CALIB_FIX_ASPECT_RATIO |
+                     cv::CALIB_ZERO_TANGENT_DIST);
+
+  cout << error1 << endl;
+  cout << error2 << endl;
+
+  // save the intrinsic results
+  cv::FileStorage fIntrinsicsL(intrinsicsYmlL, cv::FileStorage::WRITE);
+  cv::FileStorage fIntrinsicsR(intrinsicsYmlR, cv::FileStorage::WRITE);
+  fIntrinsicsL << "M" << M1;
+  fIntrinsicsL << "D" << D1;
+  fIntrinsicsL << "e" << error1;
+  fIntrinsicsR << "M" << M2;
+  fIntrinsicsR << "D" << D2;
+  fIntrinsicsR << "e" << error2;
+  cout << "Done single calibration!\n\n";
+
+  fIntrinsicsL.release();
+  fIntrinsicsR.release();
+
+  // 3. stereo calibration
+  //
+  cout << "\nRunning stereo camera calibration ...\n";
+  cv::stereoCalibrate(objectPoints, points[0], points[1], 
+                    M1, D1, M2, D2, imageSize, R, T, E, F,
+                    cv::CALIB_FIX_ASPECT_RATIO | 
+                    cv::CALIB_ZERO_TANGENT_DIST |
+                    cv::CALIB_FIX_INTRINSIC,
+                    cv::TermCriteria(
+                      cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 100,1e-5)
+                    );
+  
+  int nFrames = (int)objectPoints.size();
+  double err = checkCalibrationQuality(points, M1, D1, M2, D2, F, nFrames, nCorners);
+  cout << "avg err = " <<  err << endl;
+
+  // Save the extrinsic calibration results
+  cv::FileStorage fExtrinsics(extrinsicsYml, cv::FileStorage::WRITE);
+  fExtrinsics << "R" << R;
+  fExtrinsics << "T" << T;
+  fExtrinsics << "E" << E;
+  fExtrinsics << "F" << F;
+  fExtrinsics << "e" << err;
+  fExtrinsics.release();
+
+  cout << "Stereo calibration Done!\n\n";
+
+  // 4. rectification (BOUGUET'S METHOD)
+  cv::Mat R1, R2, P1, P2, map11, map12, map21, map22;
+  stereoRectify(M1, D1, M2, D2, imageSize, R, T, R1, R2, P1, P2,
+                cv::noArray(), 0);
+  // Precompute maps for cvRemap()
+  initUndistortRectifyMap(M1, D1, R1, P1, imageSize, CV_16SC2, map11,
+                          map12);
+  initUndistortRectifyMap(M2, D2, R2, P2, imageSize, CV_16SC2, map21,
+                          map22);
+  
+  // 5. Setup for finding stereo corrrespondences
+  //
+  cv::Mat pair;
+  pair.create(imageSize.height, imageSize.width * 2, CV_8UC3);
+  // cv::Ptr<cv::StereoSGBM> stereo = cv::StereoSGBM::create(
+  //     -64, 320, 3, 600, 2400, 0, 4, 1, 150, 1, cv::StereoSGBM::MODE_HH);
+  cv::Ptr<cv::StereoMatcher> stereo = cv::StereoSGBM::create(0,   // minimum disparity
+                                                            256,  // maximum disparity
+                                                            5);  // block size
+  // for (i = 0; i < nFrames; i++) {
+  //   cv::Mat img1 = cv::imread(imageNames[0][i], 0);
+  //   cv::Mat img2 = cv::imread(imageNames[1][i], 0);
+  //   string rectName = "rectified_" + to_string(i) + ".png";
+  //   string dispName = "disp_" + to_string(i) + ".png";
+  //   rectifyAndDisp(img1, img2, pair,
+  //                  map11, map12, map21, map22,
+  //                  stereo, rectName, dispName);
+  //   // if ((cv::waitKey() & 255) == 27)
+  //   //   break;
+  // }
+  cv::Mat targetL = cv::imread("../targetImgL.png", 0);
+  cv::Mat targetR = cv::imread("../targetImgR.png", 0);
+  cv::GaussianBlur(targetL, targetL, cv::Size(5, 5), 0);
+  cv::GaussianBlur(targetR, targetR, cv::Size(5, 5), 0);
+
+  string rectName = "targetRect.png";
+  string dispName = "targetDisp.png";
+  rectifyAndDisp(targetL, targetR, pair,
+                map11, map12, map21, map22,
+                stereo, rectName, dispName);
+  cout << "target" <<endl;
+}
+
+void rectifyAndDisp(cv::Mat img1, cv::Mat img2, cv::Mat pair, 
+                    cv::Mat map11, cv::Mat map12, cv::Mat map21, cv::Mat map22,
+                    cv::Ptr<cv::StereoMatcher> stereo,
+                    string rectName, string dispName) 
+{
+    cv::Mat img1r, img2r, disp;
+    if (img1.empty() || img2.empty())
+      return;
+    cv::remap(img1, img1r, map11, map12, cv::INTER_LINEAR);
+    cv::remap(img2, img2r, map21, map22, cv::INTER_LINEAR);
+    // paste two rectified images side-by-side 
+    cv::Mat part = pair.colRange(0, img1.cols);
+    cvtColor(img1r, part, cv::COLOR_GRAY2BGR);
+    part = pair.colRange(img1.cols, img1.cols * 2);
+    cvtColor(img2r, part, cv::COLOR_GRAY2BGR);
+    // and draw horizontal epipolar lines
+    for (int j = 0; j < img1.cols; j += 16)
+      cv::line(pair, cv::Point(0, j), cv::Point(img1.cols * 2, j),
+                cv::Scalar(0, 255, 0));
+    // compute disparity image using rectified images
+    stereo->compute(img1r, img2r, disp);
+    cv::imwrite(rectName, pair);
+    cv::imwrite(dispName, disp);
+}
 
 void help(char *argv[]) {
   cout
-      << "\n\nExample 19-3. Stereo calibration, rectification, and "
+      << "\n\nMinions: Stereo calibration, rectification, and "
          "correspondence"
-      << "\n    Reads in list of locations of a sequence of checkerboard "
-         "calibration"
-      << "\n    objects from a left,right stereo camera pair. Calibrates, "
-         "rectifies and then"
-      << "\n    does stereo correspondence."
-      << "\n"
-      << "\n    This program will run on default parameters assuming you "
-         "created a build directory"
-      << "\n    directly below the Learning-OpenCV-3 directory and are "
-         "running programs there.   NOTE: the list_of_stereo_pairs> must"
-      << "\n    give the full path name to the left right images, in "
-         "alternating"
-      << "\n    lines: left image, right image, one path/filename per line, see"
-      << "\n    stereoData/example_19-03_list.txt file, you can comment out "
-         "lines"
-      << "\n    there by starting them with #."
-      << "\n"
-      << "\nDefault Call (with parameters: board_w = 9, board_h = 6, list = "
-         "../stereoData_19-03_list.txt):"
-      << "\n" << argv[0] << "\n"
-      << "\nManual call:"
-      << "\n" << argv[0] << " [<board_w> <board_h> <path/list_of_stereo_pairs>]"
-      << "\n\n PRESS ANY KEY TO STEP THROUGH RESULTS AT EACH STAGE."
+      << "\n    Parameters: number of images, board width, board height, image directory"
       << "\n" << endl;
 }
 
@@ -48,132 +308,87 @@ string concatFileName(int camNo, int curFrame)
 
 string concatFilePath(string dataDir, string fileName)
 {
-  string filePath = "../" + dataDir + "/" + fileName + ".jpg";
+  string filePath = dataDir + "/" + fileName + ".png";
   return filePath;
 }
 
-static void StereoCalib(int nImages, int nx, int ny,
-                        string dataDir,
-                        bool useUncalibrated) {
-  bool displayCorners = false;
-  bool showUndistorted = true;
-  bool isVerticalStereo = false; // horiz or vert cams
-  const int maxScale = 1;
-  const float squareSize = 1.f;
-  int nCam = 2;
-
-  // actual square size
-  int i, j, k, lr;
-  int N = nx * ny;
-  cv::Size board_sz = cv::Size(nx, ny);
-  vector<string> imageNames[2];
-  vector<cv::Point3f> boardModel;
-  vector<vector<cv::Point3f> > objectPoints;
-  vector<vector<cv::Point2f> > points[2];
-  vector<cv::Point2f> corners[2];
-  bool found[2] = {false, false};
-  cv::Size imageSize;
-
-  for (i = 0; i < ny; i++) {
-    for (j = 0; j < nx; j++) {
-      boardModel.push_back(cv::Point3f((float)(i * squareSize), (float)(j * squareSize), 0.f));
+bool checkExistingCorners(string imgName, string ymlName,
+                          vector<cv::Point2f> *corners, 
+                          int lr, int nCorners)
+{
+  cv::FileStorage fs(ymlName, cv::FileStorage::READ);
+  bool hasData = false;
+  if (fs.isOpened()) {
+    cv::Mat mcorners;
+    fs[imgName] >> mcorners;
+    cout << mcorners.size() << endl;
+    if (mcorners.cols == 1 && mcorners.rows == nCorners ) {
+      mcorners = mcorners.reshape(2, nCorners);
+      corners[lr] = mcorners.clone();
+      hasData = true;
     }
   }
+  fs.release();
+  return hasData;
+}
 
-  for (k = 1; k <= nImages; k++) {
-    for (lr = 0; lr < nCam; lr++) {
-      string imgName = concatFileName(lr+1, k);
-      string ymlName = imgName + ".yml";
-      cv::FileStorage fs(ymlName, cv::FileStorage::READ);
-      bool hasData = false;
-      if (fs.isOpened()) {
-        cv::Mat mcorners;
-        fs[imgName] >> mcorners;
-        cout << mcorners.size() << endl;
-        if (mcorners.cols == 1 && mcorners.rows == N ) {
-          mcorners = mcorners.reshape(2, N);
-          corners[lr] = mcorners.clone();
-          found[lr] = true;
-          cout << corners[lr] << endl;
-          hasData = true;
-        }
-      }
-      string imgPath = concatFilePath(dataDir, imgName);
-      cout << imgPath << endl;
-      imageNames[lr].push_back(imgPath);
-      cv::Mat img = cv::imread(imgPath, 0);
-      imageSize = img.size();
+bool autoFindCorners(cv::Mat img, cv::Size board_sz, 
+                     vector<cv::Point2f> *corners, int lr)
+{
+  bool foundGrid = false;
+  int beta = 0;
+  cv::SimpleBlobDetector::Params params;
 
-      if (!hasData) {
-        if (img.empty())
-          break;
-
-        // Find circle grids and centers therein:
-        for (int s = 1; s <= maxScale; s++) {
-          cv::Mat timg;
-          img.convertTo(timg, -1, 4, 0);
-          if (s > 1)
-            resize(img, timg, cv::Size(), s, s, cv::INTER_CUBIC);
-          // Just as example, this would be the call if you had circle calibration
-          // boards ...
-          //      found[lr] = cv::findCirclesGrid(timg, cv::Size(nx, ny),
-          //      corners[lr],
-          //                                      cv::CALIB_CB_ASYMMETRIC_GRID |
-          //                                          cv::CALIB_CB_CLUSTERING);
-          //...but we have chessboards in our images
-          found[lr] = cv::findChessboardCorners(timg, board_sz, corners[lr]);
-          cout << corners[lr].size() << endl;
-          if (found[lr] || s == maxScale) {
-            cv::Mat mcorners(corners[lr]);
-            mcorners *= (1. / s);
-            cv::FileStorage fs(ymlName, cv::FileStorage::WRITE);
-
-            cout << mcorners.size() << endl;
-            fs << imgName << mcorners;
-            fs.release();
-          }
-          if (found[lr])
-            break;
-        }
-      }
-      if (displayCorners) {
-
-        // draw chessboard corners works for circle grids too
-        cv::drawChessboardCorners(img, cv::Size(nx, ny), corners[lr], found[lr]);
-        cv::imshow("Corners", img);
-        if ((cv::waitKey(0) & 255) == 27) // Allow ESC to quit
-          exit(-1);
-      }
-      if (lr == 1 && found[0] && found[1]) {
-        objectPoints.push_back(boardModel);
-        points[0].push_back(corners[0]);
-        points[1].push_back(corners[1]);
-        cout << imageSize << endl;
-      }
+  params.maxArea = 1e10;
+  cv::Ptr<cv::FeatureDetector> blobDetector = cv::SimpleBlobDetector::create(params);
+//   std::vector<cv::KeyPoint> keypoints;
+//   blobDetector->detect( img, keypoints);
+ 
+// // Draw detected blobs as red circles.
+// // DrawMatchesFlags::DRAW_RICH_KEYPOINTS flag ensures the size of the circle corresponds to the size of blob
+//   cv::Mat im_with_keypoints;
+//   cv::drawKeypoints( img, keypoints, im_with_keypoints, cv::Scalar(0,0,255), cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS );
+ 
+// // Show blobs
+// cv::imshow("keypoints", im_with_keypoints );
+// cv::waitKey(0);
+  for (int alpha = 1; alpha <= 20; alpha++) 
+  {
+    // contrast affects the detection quality. 
+    // slowly raise the contrast higher in every iteration
+    cv::Mat timg;
+    img.convertTo(timg, -1, alpha*0.5f, beta);
+    foundGrid = cv::findChessboardCorners(timg, board_sz, corners[lr],
+                cv::CALIB_CB_FAST_CHECK);
+    // // below for circular grid calibration target
+    // foundGrid = cv::findCirclesGrid(timg, board_sz,
+    //                                 corners[lr],
+    //                                 cv::CALIB_CB_ASYMMETRIC_GRID|cv::CALIB_CB_CLUSTERING,
+    //                                 blobDetector);
+    if(foundGrid)
+    {
+      // we will do more accurate corner detection using SubPix
+      cout << alpha << endl;
+      cornerSubPix(timg, corners[lr], cv::Size(36, 36), cv::Size(-1, -1),
+        cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 100, 1e-2));
+      break;
     }
   }
-  // CALIBRATE THE STEREO CAMERAS
-  cv::Mat M1 = cv::Mat::eye(3, 3, CV_64F);
-  cv::Mat M2 = cv::Mat::eye(3, 3, CV_64F);
-  cv::Mat D1, D2, R, T, E, F;
-  cout << "\nRunning stereo calibration ...\n";
-  cv::stereoCalibrate(
-      objectPoints, points[0], points[1], M1, D1, M2, D2, imageSize, R, T, E, F,
-      cv::CALIB_FIX_ASPECT_RATIO | cv::CALIB_ZERO_TANGENT_DIST |
-          cv::CALIB_SAME_FOCAL_LENGTH,
-      cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 100,
-                       1e-5));
-  cout << "Done! Press any key to step through images, ESC to exit\n\n";
-  cout << M1 << endl;
-  // CALIBRATION QUALITY CHECK
-  // because the output fundamental matrix implicitly
-  // includes all the output information,
-  // we can check the quality of calibration using the
-  // epipolar geometry constraint: m2^t*F*m1=0
+  return foundGrid;
+}
+
+
+// because the output fundamental matrix implicitly
+// includes all the output information,
+// we can check the quality of calibration using the
+// epipolar geometry constraint: m2^t*F*m1=0
+double checkCalibrationQuality(vector<vector<cv::Point2f>> points[2],
+                              cv::Mat M1, cv::Mat D1,  cv::Mat M2, cv::Mat D2,
+                              cv::Mat F, int nFrames, int nCorners)
+{ 
   vector<cv::Point3f> lines[2];
   double avgErr = 0;
-  int nframes = (int)objectPoints.size();
-  for (i = 0; i < nframes; i++) {
+  for (int i = 0; i < nFrames; i++) {
     vector<cv::Point2f> &pt0 = points[0][i];
     vector<cv::Point2f> &pt1 = points[1][i];
     cv::undistortPoints(pt0, pt0, M1, D1, cv::Mat(), M1);
@@ -181,7 +396,7 @@ static void StereoCalib(int nImages, int nx, int ny,
     cv::computeCorrespondEpilines(pt0, 1, F, lines[0]);
     cv::computeCorrespondEpilines(pt1, 2, F, lines[1]);
 
-    for (j = 0; j < N; j++) {
+    for (int j = 0; j < nCorners; j++) {
       double err = fabs(pt0[j].x * lines[1][j].x + pt0[j].y * lines[1][j].y +
                         lines[1][j].z) +
                    fabs(pt1[j].x * lines[0][j].x + pt1[j].y * lines[0][j].y +
@@ -189,124 +404,10 @@ static void StereoCalib(int nImages, int nx, int ny,
       avgErr += err;
     }
   }
-  cout << "avg err = " << avgErr / (nframes * N) << endl;
-
-  // COMPUTE AND DISPLAY RECTIFICATION
-  //
-  if (showUndistorted) {
-    cv::Mat R1, R2, P1, P2, map11, map12, map21, map22;
-
-    // IF BY CALIBRATED (BOUGUET'S METHOD)
-    //
-    if (!useUncalibrated) {
-      stereoRectify(M1, D1, M2, D2, imageSize, R, T, R1, R2, P1, P2,
-                    cv::noArray(), 0);
-      isVerticalStereo = fabs(P2.at<double>(1, 3)) > fabs(P2.at<double>(0, 3));
-      // Precompute maps for cvRemap()
-      initUndistortRectifyMap(M1, D1, R1, P1, imageSize, CV_16SC2, map11,
-                              map12);
-      initUndistortRectifyMap(M2, D2, R2, P2, imageSize, CV_16SC2, map21,
-                              map22);
-    }
-
-    // OR ELSE HARTLEY'S METHOD
-    //
-    else {
-
-      // use intrinsic parameters of each camera, but
-      // compute the rectification transformation directly
-      // from the fundamental matrix
-      vector<cv::Point2f> allpoints[2];
-      for (i = 0; i < nframes; i++) {
-        copy(points[0][i].begin(), points[0][i].end(),
-             back_inserter(allpoints[0]));
-        copy(points[1][i].begin(), points[1][i].end(),
-             back_inserter(allpoints[1]));
-      }
-      cv::Mat F = findFundamentalMat(allpoints[0], allpoints[1], cv::FM_8POINT);
-      cv::Mat H1, H2;
-      cv::stereoRectifyUncalibrated(allpoints[0], allpoints[1], F, imageSize,
-                                    H1, H2, 3);
-      R1 = M1.inv() * H1 * M1;
-      R2 = M2.inv() * H2 * M2;
-
-      // Precompute map for cvRemap()
-      //
-      cv::initUndistortRectifyMap(M1, D1, R1, P1, imageSize, CV_16SC2, map11,
-                                  map12);
-      cv::initUndistortRectifyMap(M2, D2, R2, P2, imageSize, CV_16SC2, map21,
-                                  map22);
-    }
-
-    // RECTIFY THE IMAGES AND FIND DISPARITY MAPS
-    //
-    cv::Mat pair;
-    pair.create(imageSize.height, imageSize.width * 2, CV_8UC3);
-    // Setup for finding stereo corrrespondences
-    //
-    cv::Ptr<cv::StereoSGBM> stereo = cv::StereoSGBM::create(
-        -64, 128, 11, 100, 1000, 32, 0, 15, 1000, 16, cv::StereoSGBM::MODE_HH);
-
-    for (i = 0; i < nframes; i++) {
-      cv::Mat img1 = cv::imread(imageNames[0][i], 0);
-      cv::Mat img2 = cv::imread(imageNames[1][i], 0);
-      cv::Mat img1r, img2r, disp, vdisp;
-      if (img1.empty() || img2.empty())
-        continue;
-      cv::remap(img1, img1r, map11, map12, cv::INTER_LINEAR);
-      cv::remap(img2, img2r, map21, map22, cv::INTER_LINEAR);
-
-      cv::Mat part = pair.colRange(0, imageSize.width);
-      cvtColor(img1r, part, cv::COLOR_GRAY2BGR);
-      part = pair.colRange(imageSize.width, imageSize.width * 2);
-      cvtColor(img2r, part, cv::COLOR_GRAY2BGR);
-      for (j = 0; j < imageSize.height; j += 16)
-        cv::line(pair, cv::Point(0, j), cv::Point(imageSize.width * 2, j),
-                  cv::Scalar(0, 255, 0));
-      cv::imshow("rectified", pair);
-      // Compute disparity
-      // cv::Mat disparity;
-      // cv::Ptr<cv::StereoMatcher> pStereo = cv::StereoSGBM::create(0,   // minimum disparity
-      //                                                           256,  // maximum disparity
-      //                                                           5);  // block size
-      // pStereo->compute(img1r, img2r, disparity);
-      // cv::imshow("depth", disparity);
-      if ((cv::waitKey() & 255) == 27)
-        break;
-    }
-  }
+  return avgErr / (nFrames * nCorners);
 }
 
-//
-//Default Call (with parameters: board_w = 9, board_h = 6, list =
-//  ../stereoData_19-03_list.txt):
-//./example_19-03
-//
-//Manual call:
-//./example_19-03 [<board_w> <board_h> <path/list_of_stereo_pairs>]
-//
-// Press any key to step through results, ESC to exit
-//
-
-
-int main(int argc, char **argv) {
-  char cCurrentPath[FILENAME_MAX];
-  if (!getcwd(cCurrentPath, sizeof(cCurrentPath)))
-  {
-    return errno;
-  }
-
-  int board_w = 9, board_h = 5;
-  int nImages;
-  string dataDir;
-  if (argc == 5) {
-    nImages = atoi(argv[1]);
-    board_w = atoi(argv[2]);
-    board_h = atoi(argv[3]);
-    dataDir = argv[4];
-    StereoCalib(nImages, board_w, board_h, dataDir, true);
-  } else {
-    help(argv);
-  }
-  return 0;
+bool checkImagePairExists()
+{
+  return true;
 }
