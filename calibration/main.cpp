@@ -28,7 +28,7 @@ double checkCalibrationQuality(vector<vector<cv::Point2f>> points[2],
                               cv::Mat F, int nFrames, int nCorners);
 static void StereoCalib(int nImages, int nx, int ny,
                         string dataDir, bool useUncalibrated);
-void rectifyAndDisp(cv::Mat img1, cv::Mat img2, cv::Mat pair, 
+cv::Mat rectifyAndDisp(cv::Mat img1, cv::Mat img2, cv::Mat pair, 
                     cv::Mat map11, cv::Mat map12, cv::Mat map21, cv::Mat map22,
                     cv::Ptr<cv::StereoMatcher> stereo,
                     string rectName, string dispName);
@@ -81,7 +81,7 @@ static void StereoCalib(int nImages, int nx, int ny,
                         string dataDir,
                         bool useUncalibrated) {
   bool displayCorners = true;
-  const float squareSize = 1.f;
+  const float squareSize = 2.54f;
   int nCam = 2;
   struct stat info;
   string outputDir = dataDir + "/output";
@@ -148,7 +148,7 @@ static void StereoCalib(int nImages, int nx, int ny,
         if (displayCorners) {
           // draw chessboard corners works for circle grids too
           cv::drawChessboardCorners(img, cv::Size(nx, ny), corners[lr], found[lr]);
-          string chessboardName = outputDir + "/chessboard_" + to_string(k) + "_" + to_string(lr) + ".png";
+          string chessboardName = outputDir + "/chessboard_" + to_string(k) + "_" + to_string(lr+1) + ".png";
           cv::imwrite(chessboardName, img);
         }
         // add corners when both left and rigth images were successfully
@@ -179,7 +179,7 @@ static void StereoCalib(int nImages, int nx, int ny,
                      cv::CALIB_USE_INTRINSIC_GUESS |
                      cv::CALIB_FIX_ASPECT_RATIO |
                      cv::CALIB_ZERO_TANGENT_DIST);
-
+  cout << M1 << endl;
   cout << error1 << endl;
   cout << error2 << endl;
 
@@ -225,9 +225,9 @@ static void StereoCalib(int nImages, int nx, int ny,
   cout << "Stereo calibration Done!\n\n";
 
   // 4. rectification (BOUGUET'S METHOD)
-  cv::Mat R1, R2, P1, P2, map11, map12, map21, map22;
+  cv::Mat R1, R2, P1, P2, Q, map11, map12, map21, map22;
   stereoRectify(M1, D1, M2, D2, imageSize, R, T, R1, R2, P1, P2,
-                cv::noArray(), 0);
+                Q, 0);
   // Precompute maps for cvRemap()
   initUndistortRectifyMap(M1, D1, R1, P1, imageSize, CV_16SC2, map11,
                           map12);
@@ -242,7 +242,8 @@ static void StereoCalib(int nImages, int nx, int ny,
   //     -64, 320, 3, 600, 2400, 0, 4, 1, 150, 1, cv::StereoSGBM::MODE_HH);
   cv::Ptr<cv::StereoMatcher> stereo = cv::StereoSGBM::create(0,   // minimum disparity
                                                             256,  // maximum disparity
-                                                            5);  // block size
+                                                            13);  // block size
+  // cv::Ptr<cv::StereoMatcher> stereo = cv::StereoBM::create(256, 13);
   // for (i = 0; i < nFrames; i++) {
   //   cv::Mat img1 = cv::imread(imageNames[0][i], 0);
   //   cv::Mat img2 = cv::imread(imageNames[1][i], 0);
@@ -256,25 +257,29 @@ static void StereoCalib(int nImages, int nx, int ny,
   // }
   cv::Mat targetL = cv::imread("../targetImgL.png", 0);
   cv::Mat targetR = cv::imread("../targetImgR.png", 0);
-  cv::GaussianBlur(targetL, targetL, cv::Size(5, 5), 0);
-  cv::GaussianBlur(targetR, targetR, cv::Size(5, 5), 0);
+  cv::GaussianBlur(targetL, targetL, cv::Size(7, 7), 0);
+  cv::GaussianBlur(targetR, targetR, cv::Size(7, 7), 0);
 
-  string rectName = "targetRect.png";
-  string dispName = "targetDisp.png";
-  rectifyAndDisp(targetL, targetR, pair,
+  string rectName = "targetRect2.png";
+  string dispName = "targetDisp2_sgbm_13.png";
+  cv::Mat disp = rectifyAndDisp(targetL, targetR, pair,
                 map11, map12, map21, map22,
                 stereo, rectName, dispName);
-  cout << "target" <<endl;
+  cv::Mat depthMap(disp.size(), CV_8U);
+  cv::reprojectImageTo3D(disp, depthMap, Q);
+  cout << cv::mean(depthMap) << endl;
+
+  cout << "done" <<endl;
 }
 
-void rectifyAndDisp(cv::Mat img1, cv::Mat img2, cv::Mat pair, 
+cv::Mat rectifyAndDisp(cv::Mat img1, cv::Mat img2, cv::Mat pair, 
                     cv::Mat map11, cv::Mat map12, cv::Mat map21, cv::Mat map22,
                     cv::Ptr<cv::StereoMatcher> stereo,
                     string rectName, string dispName) 
 {
     cv::Mat img1r, img2r, disp;
     if (img1.empty() || img2.empty())
-      return;
+      return disp;
     cv::remap(img1, img1r, map11, map12, cv::INTER_LINEAR);
     cv::remap(img2, img2r, map21, map22, cv::INTER_LINEAR);
     // paste two rectified images side-by-side 
@@ -290,6 +295,7 @@ void rectifyAndDisp(cv::Mat img1, cv::Mat img2, cv::Mat pair,
     stereo->compute(img1r, img2r, disp);
     cv::imwrite(rectName, pair);
     cv::imwrite(dispName, disp);
+    return disp;
 }
 
 void help(char *argv[]) {
@@ -339,8 +345,9 @@ bool autoFindCorners(cv::Mat img, cv::Size board_sz,
   int beta = 0;
   cv::SimpleBlobDetector::Params params;
 
-  params.maxArea = 1e10;
-  cv::Ptr<cv::FeatureDetector> blobDetector = cv::SimpleBlobDetector::create(params);
+  // params.maxArea = 1e4;
+  // params.minArea = 1e3;
+  // cv::Ptr<cv::FeatureDetector> blobDetector = cv::SimpleBlobDetector::create(params);
 //   std::vector<cv::KeyPoint> keypoints;
 //   blobDetector->detect( img, keypoints);
  
@@ -348,29 +355,32 @@ bool autoFindCorners(cv::Mat img, cv::Size board_sz,
 // // DrawMatchesFlags::DRAW_RICH_KEYPOINTS flag ensures the size of the circle corresponds to the size of blob
 //   cv::Mat im_with_keypoints;
 //   cv::drawKeypoints( img, keypoints, im_with_keypoints, cv::Scalar(0,0,255), cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS );
- 
+//   cout << keypoints.size() << endl;
 // // Show blobs
-// cv::imshow("keypoints", im_with_keypoints );
-// cv::waitKey(0);
-  for (int alpha = 1; alpha <= 20; alpha++) 
+// cv::imwrite("keypoints.png", im_with_keypoints );
+  cout << board_sz << endl;
+  for (int alpha = 2; alpha <= 20; alpha++) 
   {
     // contrast affects the detection quality. 
     // slowly raise the contrast higher in every iteration
     cv::Mat timg;
     img.convertTo(timg, -1, alpha*0.5f, beta);
-    foundGrid = cv::findChessboardCorners(timg, board_sz, corners[lr],
-                cv::CALIB_CB_FAST_CHECK);
-    // // below for circular grid calibration target
-    // foundGrid = cv::findCirclesGrid(timg, board_sz,
-    //                                 corners[lr],
-    //                                 cv::CALIB_CB_ASYMMETRIC_GRID|cv::CALIB_CB_CLUSTERING,
-    //                                 blobDetector);
+    // foundGrid = cv::findChessboardCorners(timg, board_sz, corners[lr]);//,
+                                          // cv::CALIB_CB_FAST_CHECK);
+    // below for circular grid calibration target
+    foundGrid = cv::findCirclesGrid(timg, board_sz,
+                                    corners[lr],
+                                    cv::CALIB_CB_SYMMETRIC_GRID|cv::CALIB_CB_CLUSTERING
+                                    );
+    cout << alpha << endl;
+    // cout << corners[lr] << endl;
+
     if(foundGrid)
     {
-      // we will do more accurate corner detection using SubPix
-      cout << alpha << endl;
-      cornerSubPix(timg, corners[lr], cv::Size(36, 36), cv::Size(-1, -1),
-        cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 100, 1e-2));
+    //   // we will do more accurate corner detection using SubPix
+    //   cout << alpha << endl;
+    //   cornerSubPix(timg, corners[lr], cv::Size(10, 10), cv::Size(-1, -1),
+    //     cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 100, 1e-2));
       break;
     }
   }
