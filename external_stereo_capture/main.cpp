@@ -6,7 +6,7 @@
 #include "tcamcamera.h"
 #include <unistd.h>
 
-// #include "opencv2/opencv.hpp"
+#include "opencv2/opencv.hpp"
 
 #include <fstream>
 #include <omp.h>
@@ -23,10 +23,10 @@ typedef struct
     int ImageCounter;
     bool SaveNextImage;
     bool busy;
-   	// cv::Mat frame; 
+   	cv::Mat frame; 
 } CUSTOMDATA;
 
-const string SN[1] = {"43810451"}; //"15410110", "41810422"};
+const string SN[2] = {"15410110", "41810422"}; //"43810451"}; //
 
 int k = 0;
 ////////////////////////////////////////////////////////////////////
@@ -83,7 +83,7 @@ GstFlowReturn new_frame_cb(GstAppSink *appsink, gpointer data)
             gst_structure_get_int (str, "height", &height);
 
             // Create a cv::Mat, copy image data into that and save the image.
-            // pCustomData->frame.create(height,width,CV_8U);
+            pCustomData->frame.create(height,width,CV_8U);
 
             // memcpy( pCustomData->frame.data, info.data, width*height);
             // memcpy( pCustomData->frame.data, img.data, width*height);
@@ -96,6 +96,7 @@ GstFlowReturn new_frame_cb(GstAppSink *appsink, gpointer data)
             myFile.open(ImageFileName, fstream::out);
             myFile << info.data;
             myFile.close();
+            // cv::imwrite(ImageFileName, pCustomData->frame);
             // Image img(width, height, 1);
             // for (int y = 0; y < height; y++) {
             //     for (int x = 0; x < width; x++) {
@@ -159,7 +160,7 @@ int run_camera(string sn, int id)
 
     // Set video format, resolution and frame rate
     // cam.set_capture_format("GRAY8", FrameSize{2592,1944}, FrameRate{15,2});
-    cam.set_capture_format("GRAY8", FrameSize{2592,1944}, FrameRate{15, 1});
+    cam.set_capture_format("GRAY8", FrameSize{2592,1944}, FrameRate{15, 2});
     // Register a callback to be called for each new frame
     cam.set_new_frame_callback(new_frame_cb, &CustomData);
     // Start the camera
@@ -177,37 +178,35 @@ int run_camera(string sn, int id)
     {
         printf("Error %s : %s\n",ex.what(), "Trigger Mode");
     }
-    // try
-    // {
-    //     ExposureAuto = cam.get_property("Exposure Auto");
-    // }
-    // catch(std::exception &ex)    
-    // {
-    //     printf("Error %s : %s\n",ex.what(), "Exposure Automatic");
-    // }
+    try
+    {
+        ExposureAuto = cam.get_property("Exposure Auto");
+    }
+    catch(std::exception &ex)    
+    {
+        printf("Error %s : %s\n",ex.what(), "Exposure Automatic");
+    }
 
-    // try
-    // {
-    //     ExposureValue = cam.get_property("Exposure");
-    // }
-    // catch(std::exception &ex)    
-    // {
-    //     printf("Error %s : %s\n",ex.what(), "Exposure Value");
-    // }
+    try
+    {
+        ExposureValue = cam.get_property("Exposure");
+    }
+    catch(std::exception &ex)    
+    {
+        printf("Error %s : %s\n",ex.what(), "Exposure Value");
+    }
 
 
-    // // Disable automatics, so the property values can be set 
-    // if( ExposureAuto != NULL){
-    //     ExposureAuto->set(cam,0);
-    // }    // set a value
-    // if( ExposureValue != NULL){
-    //     ExposureValue->set(cam,100000);
-    // }
-    ListProperties(cam);
+    // Disable automatics, so the property values can be set 
+    if( ExposureAuto != NULL){
+        ExposureAuto->set(cam,0);
+    }    // set a value
+    if( ExposureValue != NULL){
+        ExposureValue->set(cam,40000);
+    }
+    // ListProperties(cam);
 
     cam.start();
-
-    cout << "Hello" << endl;
     sleep(1000);
     cam.stop();
     return 0;
