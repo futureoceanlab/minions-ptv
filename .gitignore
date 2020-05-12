@@ -1,3 +1,6 @@
 **/.vscode
 **/build
 .DS_Store
+ptv/data
+ptv/bokeh_original
+ptv/archive_data
